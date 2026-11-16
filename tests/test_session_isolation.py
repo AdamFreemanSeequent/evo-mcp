@@ -11,9 +11,11 @@ DelegatedAuthContext with independent StagingService and ObjectRegistry.
 import asyncio
 import base64
 import json
+import os
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 from cachetools import TTLCache
 
@@ -52,10 +54,10 @@ def _mock_access_token_obj(token: str):
     return obj
 
 
-def _mock_http_request(session_id: str):
-    """Create a mock HTTP request with mcp-session-id header."""
+def _mock_http_request(session_id: str | None):
+    """Create a mock HTTP request, optionally without a legacy session header."""
     request = MagicMock()
-    request.headers = {"mcp-session-id": session_id}
+    request.headers = {"mcp-session-id": session_id} if session_id is not None else {}
     return request
 
 
@@ -432,7 +434,7 @@ class TestConcurrentSessionCreation(unittest.IsolatedAsyncioTestCase):
 
 
 class TestTokenRefreshPreservesState(unittest.IsolatedAsyncioTestCase):
-    """Token change triggers client rebuild but staging/registry are preserved."""
+    """Legacy session header survives token refresh and preserves context state."""
 
     async def test_token_refresh_rebuilds_clients_preserves_state(self):
         # Two different tokens for the same user (iat differs → distinct strings)
@@ -454,6 +456,10 @@ class TestTokenRefreshPreservesState(unittest.IsolatedAsyncioTestCase):
                 mock_at.return_value = _mock_access_token_obj(token_v1)
                 mock_req.return_value = _mock_http_request("session-refresh")
                 context = await ctx_module.get_evo_context()
+
+                selected_org = UUID("8c0c414c-61c2-42f0-ac13-8c841919f63e")
+                context.org_id = selected_org
+                context.hub_url = "https://selected.example"
 
                 # Stage an object
                 context.object_staging._put(
@@ -482,6 +488,8 @@ class TestTokenRefreshPreservesState(unittest.IsolatedAsyncioTestCase):
 
             # Same context instance (same session)
             self.assertIs(context, context_after)
+            self.assertEqual(context_after.org_id, selected_org)
+            self.assertEqual(context_after.hub_url, "https://selected.example")
 
             # discover_and_build was called again (clients rebuilt)
             self.assertGreater(mock_build.call_count, build_count_before)
@@ -529,7 +537,7 @@ class TestManagedModeSharedContext(unittest.IsolatedAsyncioTestCase):
 
 
 class TestUserIsolation(unittest.IsolatedAsyncioTestCase):
-    """Different users with the same mcp-session-id cannot share contexts."""
+    """Legacy session headers distinguish clients even when credentials overlap."""
 
     async def test_different_users_same_session_header_isolated(self):
         token_user1 = _make_mock_token("user-alice")
@@ -563,6 +571,30 @@ class TestUserIsolation(unittest.IsolatedAsyncioTestCase):
             ctx_module.delegated_contexts.clear()
             ctx_module.session_locks.clear()
 
+    async def test_same_user_and_token_different_legacy_sessions_are_isolated(self):
+        token = _make_mock_token("user-alice")
+        ctx_module.delegated_mode = True
+        ctx_module.delegated_contexts.clear()
+        ctx_module.session_locks.clear()
+
+        try:
+            with (
+                patch("evo_mcp.contexts.helpers.get_access_token", return_value=_mock_access_token_obj(token)),
+                patch("evo_mcp.contexts.helpers.get_http_request") as mock_req,
+                patch.object(DelegatedAuthContext, "discover_and_build", new_callable=AsyncMock),
+            ):
+                mock_req.return_value = _mock_http_request("session-A")
+                context_a = await ctx_module.get_evo_context()
+                mock_req.return_value = _mock_http_request("session-B")
+                context_b = await ctx_module.get_evo_context()
+
+            self.assertIsNot(context_a, context_b)
+            self.assertIsNot(context_a.object_staging, context_b.object_staging)
+        finally:
+            ctx_module.delegated_mode = False
+            ctx_module.delegated_contexts.clear()
+            ctx_module.session_locks.clear()
+
     def test_get_client_session_id_differs_by_user(self):
         """get_client_session_id() includes user identity in the key."""
         token_alice = _make_mock_token("user-alice")
@@ -581,6 +613,110 @@ class TestUserIsolation(unittest.IsolatedAsyncioTestCase):
             id_bob = get_client_session_id()
 
         self.assertNotEqual(id_alice, id_bob)
+
+
+class TestSessionlessContextRegressions(unittest.IsolatedAsyncioTestCase):
+    """Pending CENPLAT-37353: opt in with RUN_SESSIONLESS_MCP_TESTS=1.
+
+    The shared-token case must supply distinct client context handles once the
+    stateless API defines them; without a header or handle, clients are identical.
+    """
+
+    def setUp(self):
+        self.original_delegated_mode = ctx_module.delegated_mode
+        ctx_module.delegated_mode = True
+        ctx_module.delegated_contexts.clear()
+        ctx_module.session_locks.clear()
+
+    def tearDown(self):
+        ctx_module.delegated_contexts.clear()
+        ctx_module.session_locks.clear()
+        ctx_module.delegated_mode = self.original_delegated_mode
+
+    @unittest.skipUnless(
+        os.getenv("RUN_SESSIONLESS_MCP_TESTS") == "1",
+        "CENPLAT-37353: sessionless token refresh does not preserve instance selection",
+    )
+    async def test_refresh_preserves_selected_instance_without_session_header(self):
+        token_v1 = _make_mock_token("user-refresh", iat=1000)
+        token_v2 = _make_mock_token("user-refresh", iat=2000)
+        selected_org = UUID("8c0c414c-61c2-42f0-ac13-8c841919f63e")
+
+        with (
+            patch("evo_mcp.contexts.helpers.get_access_token") as mock_at,
+            patch("evo_mcp.contexts.helpers.get_http_request", return_value=_mock_http_request(None)),
+            patch.object(DelegatedAuthContext, "discover_and_build", new_callable=AsyncMock),
+        ):
+            mock_at.return_value = _mock_access_token_obj(token_v1)
+            context = await ctx_module.get_evo_context()
+            context.org_id = selected_org
+            context.hub_url = "https://selected.example"
+
+            mock_at.return_value = _mock_access_token_obj(token_v2)
+            refreshed = await ctx_module.get_evo_context()
+
+        self.assertEqual(refreshed.org_id, selected_org)
+        self.assertEqual(refreshed.hub_url, "https://selected.example")
+
+    @unittest.skipUnless(
+        os.getenv("RUN_SESSIONLESS_MCP_TESTS") == "1",
+        "CENPLAT-37353: sessionless token refresh loses staged objects",
+    )
+    async def test_refresh_preserves_staging_without_session_header(self):
+        token_v1 = _make_mock_token("user-refresh", iat=1000)
+        token_v2 = _make_mock_token("user-refresh", iat=2000)
+
+        with (
+            patch("evo_mcp.contexts.helpers.get_access_token") as mock_at,
+            patch("evo_mcp.contexts.helpers.get_http_request", return_value=_mock_http_request(None)),
+            patch.object(DelegatedAuthContext, "discover_and_build", new_callable=AsyncMock),
+        ):
+            mock_at.return_value = _mock_access_token_obj(token_v1)
+            context = await ctx_module.get_evo_context()
+            context.object_staging._put(
+                StagedEnvelope(
+                    stage_id="stage-sessionless",
+                    object_type="variogram",
+                    workspace_id=None,
+                    source_ref={},
+                    status="active",
+                    updated_at="2026-01-01T00:00:00+00:00",
+                    expires_at="2099-01-01T00:00:00+00:00",
+                ),
+                {"refreshed": True},
+            )
+            context.object_registry.register(
+                name="sessionless variogram",
+                object_type="variogram",
+                stage_id="stage-sessionless",
+            )
+
+            mock_at.return_value = _mock_access_token_obj(token_v2)
+            refreshed = await ctx_module.get_evo_context()
+
+        entry = refreshed.object_registry.resolve("sessionless variogram")
+        self.assertEqual(entry.stage_id, "stage-sessionless")
+        _, payload = refreshed.object_staging.get_stage_payload(entry.stage_id)
+        self.assertEqual(payload, {"refreshed": True})
+
+    @unittest.skipUnless(
+        os.getenv("RUN_SESSIONLESS_MCP_TESTS") == "1",
+        "CENPLAT-37353: clients sharing a token need separate stateless context handles",
+    )
+    async def test_clients_sharing_token_do_not_share_context_without_session_header(self):
+        token = _make_mock_token("user-alice")
+
+        with (
+            patch("evo_mcp.contexts.helpers.get_access_token", return_value=_mock_access_token_obj(token)),
+            patch("evo_mcp.contexts.helpers.get_http_request", return_value=_mock_http_request(None)),
+            patch.object(DelegatedAuthContext, "discover_and_build", new_callable=AsyncMock),
+        ):
+            client_a = await ctx_module.get_evo_context()
+            client_a.org_id = UUID("8c0c414c-61c2-42f0-ac13-8c841919f63e")
+            client_b = await ctx_module.get_evo_context()
+
+        self.assertIsNot(client_a, client_b)
+        self.assertIsNone(client_b.org_id)
 
 
 # ---------------------------------------------------------------------------
