@@ -168,18 +168,23 @@ sequenceDiagram
     MCP-->>Client: Proxy access token
 
     Note over Client,Evo: 4. Authenticated MCP requests
-    Client->>MCP: POST /mcp (tool call)<br/>Authorization: Bearer <proxy_token><br/>mcp-session-id: <session_id>
+    alt Legacy session-based MCP
+        Client->>MCP: POST /mcp (tool call)<br/>Authorization: Bearer <proxy_token><br/>mcp-session-id: <session_id>
+    else Sessionless MCP (2026-07-28)
+        Client->>MCP: POST /mcp (tool call)<br/>Authorization: Bearer <proxy_token><br/>no mcp-session-id
+    end
     activate MCP
 
-    Note over MCP: Extract upstream IMS token<br/>from proxy token.<br/>Derive session key:<br/>sha256(user_sub + session_id)
+    Note over MCP: Extract upstream IMS token<br/>from proxy token
+    Note over MCP: Legacy key: sub + session ID<br/>Sessionless key: sub + token
 
-    alt Existing session
+    alt Existing key
         MCP->>MCP: Reuse DelegatedAuthContext
-    else New session
+    else New key
         MCP->>MCP: Create DelegatedAuthContext
     end
 
-    alt Token changed since last request
+    opt Token changed with same key (legacy)
         Note over MCP: Rebuild API clients,<br/>preserve org/hub selection
     end
 
@@ -197,11 +202,11 @@ sequenceDiagram
 | `forward_resource=False` | MCP clients send RFC 8707 `resource` parameter. Bentley IMS rejects unknown resource URLs with `invalid_target`. OIDCProxy strips it before forwarding to IMS. |
 | `token_endpoint_auth_method: "none"` | AI clients are public OAuth clients (no client secret). IMS native/SPA apps use PKCE only. |
 | Configurable redirect path | In CLIENT DELEGATED AUTH mode, the MCP server receives the IMS OAuth callback. The callback path defaults to `/signin-callback` and can be overridden via `OIDCPROXY_REDIRECT_PATH`. The full redirect URI registered in IMS must be `{MCP_PUBLIC_BASE_URL}{OIDCPROXY_REDIRECT_PATH}`. |
-| Composite session key | `sha256(user_sub + mcp-session-id)` prevents session-ID spoofing — even with a forged header, the `sub` claim from the JWT differs per user. |
+| Composite session key | On legacy connections, `sha256(user_sub + ":" + mcp-session-id)` prevents cross-user session-ID spoofing. Sessionless connections use the upstream token instead of a session header. |
 
 ## Session lifecycle (delegated mode)
 
-Each authenticated client gets its own `DelegatedAuthContext` managed by a `_CleanupTTLCache`.
+Each distinct session key gets its own `DelegatedAuthContext` managed by a `_CleanupTTLCache`. Sessionless clients sharing a token share a context.
 
 ```mermaid
 stateDiagram-v2
@@ -209,16 +214,17 @@ stateDiagram-v2
     Created --> Active: initialize()<br/>discovers org & hub,<br/>builds API clients
 
     Active --> Active: Same token →<br/>skip rebuild
-    Active --> Rebuilding: Token refreshed<br/>(new upstream token)
+    Active --> Rebuilding: Legacy token refresh
     Rebuilding --> Active: Rebuild API clients,<br/>preserve org/hub<br/>via seed values
 
     Active --> Evicted: TTL expired (1h)<br/>or max sessions (1000)
     Evicted --> [*]: cleanup()<br/>remove temp dir + lock
 
     note right of Active
-        Session key = sha256(user_sub + mcp-session-id)
-        Stored in _CleanupTTLCache
-        TTL resets on each request
+        Legacy: sub + session ID
+        Sessionless: sub + token
+        Sessionless refresh: new context
+        Cache TTL resets on access
     end note
 ```
 
