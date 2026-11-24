@@ -23,7 +23,6 @@ from cachetools import TTLCache
 from dotenv import load_dotenv
 
 from evo_mcp.contexts import DelegatedAuthContext, EvoContextBase, ManagedAuthContext
-from evo_mcp.contexts.helpers import get_client_session_id
 from evo_mcp.session_support import modern_session_id, validated_session_key
 
 # Load environment variables from .env file
@@ -116,10 +115,9 @@ async def get_evo_context() -> EvoContextBase:
 
     In managed mode, returns the single shared ManagedAuthContext.
     In delegated mode, looks up (or creates) a DelegatedAuthContext
-    keyed by the legacy transport session ID or the validated explicit
-    conversation ID. On every request the context is
-    re-initialized with the current access token, rebuilding API clients
-    cleanly while preserving instance selection via seeds.
+    keyed by the authenticated conversation ID. On every request the
+    context is re-initialized with the current access token, rebuilding
+    API clients cleanly while preserving instance selection via seeds.
     """
     if not delegated_mode:
         global managed_context
@@ -129,14 +127,15 @@ async def get_evo_context() -> EvoContextBase:
         return managed_context
 
     explicit_id = modern_session_id()
-    session_id = await validated_session_key(explicit_id, refresh=False) if explicit_id else get_client_session_id()
+    if explicit_id is None:
+        raise ValueError("A delegated tool call requires a session_id from create_session.")
+    session_id = await validated_session_key(explicit_id, refresh=False)
 
     # Per-session lock prevents duplicate context creation when
     # concurrent requests arrive for the same new session.
     lock = session_locks.setdefault(session_id, asyncio.Lock())
     async with lock:
-        if explicit_id:
-            await validated_session_key(explicit_id)
+        await validated_session_key(explicit_id)
         context = delegated_contexts.get(session_id)
         if context is None:
             context = DelegatedAuthContext(client_session_id=session_id)

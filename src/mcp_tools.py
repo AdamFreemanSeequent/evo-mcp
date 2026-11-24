@@ -39,6 +39,7 @@ from starlette.responses import JSONResponse
 from evo_mcp.client_auth import create_auth_provider
 from evo_mcp.context import SESSION_TTL_SECONDS
 from evo_mcp.file_transfer import file_transfer_lifespan
+from evo_mcp.session_support import StatelessProtocolMiddleware
 from evo_mcp.tool_strategy import BOOTSTRAP_TOOLS, SearchEngine, ToolStrategy, apply_strategy
 from evo_mcp.tools import (
     register_admin_tools,
@@ -142,9 +143,9 @@ if REMOTE_FILE_TRANSFER:
     SERVER_INSTRUCTIONS += "\n" + FILE_TRANSFER_INSTRUCTIONS
 if CLIENT_DELEGATED_AUTH:
     SERVER_INSTRUCTIONS += (
-        "\nFor sessionless MCP connections, call create_session once per conversation "
+        "\nCall create_session once per conversation "
         "and pass its session_id on each tool call (inside arguments for call_tool). "
-        "Call end_session when finished. Legacy MCP sessions need no session_id argument."
+        "Call end_session when finished."
     )
 
 # MCP_PUBLIC_BASE_URL supports reverse proxy / TLS deployments where the
@@ -167,6 +168,7 @@ mcp = FastMCP(
         else None
     ),
 )
+mcp.add_middleware(StatelessProtocolMiddleware())
 if CLIENT_DELEGATED_AUTH:
     from evo_mcp.session_support import (
         ConversationSessionArguments,
@@ -540,6 +542,7 @@ if __name__ == "__main__":
             transport="http",
             host=HTTP_HOST,
             port=HTTP_PORT,
+            stateless_http=True,
         )
 
     else:

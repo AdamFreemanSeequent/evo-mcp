@@ -18,15 +18,13 @@ from fastmcp.server.transforms import GetToolNext, Transform
 from fastmcp.tools.base import Tool
 from fastmcp.utilities.versions import VersionSpec
 from mcp_types import CallToolRequestParams
+from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 
 from evo_mcp.contexts.helpers import get_client_session_upstream_access_token, get_user_id_from_token
 
 _modern_session_id: ContextVar[str | None] = ContextVar("evo_modern_session_id", default=None)
 _LIFECYCLE_TOOLS = frozenset({"create_session", "end_session", "search_tools", "call_tool"})
-_SESSION_DESCRIPTION = (
-    "For a sessionless connection, first call create_session and pass its ID here on "
-    "every call in this conversation. Legacy MCP sessions do not need this argument."
-)
+_SESSION_DESCRIPTION = "Call create_session first and pass its ID here on every call in this conversation."
 
 
 def _user_id() -> str:
@@ -122,7 +120,7 @@ class ConversationSessionArguments(Transform):
 class ConversationSessionMiddleware(Middleware):
     async def on_call_tool(self, context: MiddlewareContext[CallToolRequestParams], call_next):
         request = context.fastmcp_context.request_context if context.fastmcp_context else None
-        if request is None or request.protocol_version < "2026-07-28":
+        if request is None:
             return await call_next(context)
 
         name = context.message.name
@@ -143,3 +141,11 @@ class ConversationSessionMiddleware(Middleware):
 
 def modern_session_id() -> str | None:
     return _modern_session_id.get()
+
+
+class StatelessProtocolMiddleware(Middleware):
+    async def on_request(self, context: MiddlewareContext, call_next):
+        request = context.fastmcp_context.request_context if context.fastmcp_context else None
+        if request is not None and request.protocol_version not in MODERN_PROTOCOL_VERSIONS:
+            raise ValueError("This server requires the stateless MCP protocol (2026-07-28 or newer).")
+        return await call_next(context)

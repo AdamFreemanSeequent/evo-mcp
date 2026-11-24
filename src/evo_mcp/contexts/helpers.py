@@ -2,10 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import hashlib
-
 import jwt as pyjwt
-from fastmcp.server.dependencies import get_access_token, get_http_request
+from fastmcp.server.dependencies import get_access_token
 
 
 def get_user_id_from_token(token: str) -> str:
@@ -23,29 +21,10 @@ def get_user_id_from_token(token: str) -> str:
 def get_client_session_upstream_access_token() -> str:
     """Get the upstream access token for the current MCP client session.
 
-    This is used as part of the composite key for session identification and
-    also to detect token changes on each request for context re-initialization.
+    This identifies the user owning a conversation and detects token changes
+    on each request for context re-initialization.
     """
     token_obj = get_access_token()
     if not token_obj or not token_obj.token:
         raise RuntimeError("No FastMCP access token available in delegated auth mode")
     return token_obj.token
-
-
-def get_client_session_id() -> str:
-    """Return a stable identifier for the current MCP client session.
-
-    Combines the ``mcp-session-id`` HTTP header with the user's identity
-    (``sub`` claim from the IMS JWT). This composite key prevents
-    session-ID spoofing across users. A missing header is an error:
-    token-based identity cannot preserve state across token refreshes.
-    """
-    upstream_access_token = get_client_session_upstream_access_token()
-    user_id = get_user_id_from_token(upstream_access_token)
-
-    request = get_http_request()
-    session_id = request.headers.get("mcp-session-id")
-    if not session_id:
-        raise RuntimeError("Missing mcp-session-id header in delegated auth mode; a legacy MCP session is required")
-    composite = f"{user_id}:{session_id}"
-    return hashlib.sha256(composite.encode()).hexdigest()[:32]
